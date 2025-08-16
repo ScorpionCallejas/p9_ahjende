@@ -1,6 +1,6 @@
 # Conteos Recursivos desde Ejecutivos
 
-<img width="766" height="625" alt="imagen" src="https://github.com/user-attachments/assets/6feed4dc-9673-4b25-abd8-69c5d290b3bd" />
+<img width="753" height="626" alt="imagen" src="https://github.com/user-attachments/assets/eec681ce-77b5-4c90-adc5-60cd70d10b42" />
 
 ## Descripción
 Sistema completo para la gestión jerárquica de equipos comerciales con:
