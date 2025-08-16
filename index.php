@@ -7,7 +7,7 @@ $host = "localhost";
 $user = "root";
 $pass = "";
 $database = "db_test";
-$port = 3306;
+$port = 3307;
 
 // Establecer conexión
 $conn = new mysqli($host, $user, $pass, $database, $port);
@@ -15,6 +15,190 @@ if ($conn->connect_error) {
     die("Error de conexión: " . $conn->connect_error);
 }
 $conn->set_charset("utf8");
+
+// Función para obtener jerarquía de ejecutivos (todos los hijos)
+function getJerarquiaEjecutivos($conn, $id_eje) {
+    $ids = array();
+    $query = "SELECT id_eje FROM ejecutivo WHERE id_padre = ? AND eli_eje = 1";
+    $stmt = $conn->prepare($query);
+    $stmt->bind_param("i", $id_eje);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    while ($row = $result->fetch_assoc()) {
+        $ids[] = $row['id_eje'];
+        $hijos = getJerarquiaEjecutivos($conn, $row['id_eje']);
+        $ids = array_merge($ids, $hijos);
+    }
+    $stmt->close();
+    
+    return $ids;
+}
+
+// Función para obtener conteo acumulado (ejecutivo + todos los hijos)
+function getConteoAcumulado($conn, $id_eje, $fecha_inicio, $fecha_fin) {
+    $conteo = 0;
+    
+    // Obtener conteo individual del ejecutivo
+    $query = "SELECT COUNT(*) as total FROM citas c WHERE c.id_eje = ?";
+    if ($fecha_inicio && $fecha_fin) {
+        $query .= " AND c.fec_cit BETWEEN ? AND ?";
+    }
+    
+    $stmt = $conn->prepare($query);
+    if ($fecha_inicio && $fecha_fin) {
+        $stmt->bind_param("iss", $id_eje, $fecha_inicio, $fecha_fin);
+    } else {
+        $stmt->bind_param("i", $id_eje);
+    }
+    $stmt->execute();
+    $result = $stmt->get_result();
+    if ($result) {
+        $row = $result->fetch_assoc();
+        $conteo = $row['total'];
+    }
+    $stmt->close();
+    
+    // Obtener todos los hijos recursivamente
+    $hijos_ids = getJerarquiaEjecutivos($conn, $id_eje);
+    
+    if (!empty($hijos_ids)) {
+        $placeholders = implode(',', array_fill(0, count($hijos_ids), '?'));
+        $query = "SELECT COUNT(*) as total FROM citas c WHERE c.id_eje IN ($placeholders)";
+        if ($fecha_inicio && $fecha_fin) {
+            $query .= " AND c.fec_cit BETWEEN ? AND ?";
+        }
+        
+        $stmt = $conn->prepare($query);
+        
+        // Bind parameters
+        $types = str_repeat('i', count($hijos_ids));
+        $params = $hijos_ids;
+        
+        if ($fecha_inicio && $fecha_fin) {
+            $types .= 'ss';
+            $params[] = $fecha_inicio;
+            $params[] = $fecha_fin;
+        }
+        
+        $bind_params = array();
+        $bind_params[] = &$types;
+        for ($i=0; $i<count($params); $i++) {
+            $bind_params[] = &$params[$i];
+        }
+        
+        call_user_func_array(array($stmt, 'bind_param'), $bind_params);
+        
+        $stmt->execute();
+        $result = $stmt->get_result();
+        if ($result) {
+            $row = $result->fetch_assoc();
+            $conteo += $row['total'];
+        }
+        $stmt->close();
+    }
+    
+    return $conteo;
+}
+
+// Función para obtener conteo de plantel
+function getConteoPlantel($conn, $id_pla, $fecha_inicio, $fecha_fin) {
+    $query = "SELECT COUNT(*) as total 
+              FROM citas c 
+              WHERE c.id_pla = ?";
+    
+    if ($fecha_inicio && $fecha_fin) {
+        $query .= " AND c.fec_cit BETWEEN ? AND ?";
+    }
+    
+    $stmt = $conn->prepare($query);
+    
+    if ($fecha_inicio && $fecha_fin) {
+        $stmt->bind_param("iss", $id_pla, $fecha_inicio, $fecha_fin);
+    } else {
+        $stmt->bind_param("i", $id_pla);
+    }
+    
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $total = 0;
+    if ($result) {
+        $row = $result->fetch_assoc();
+        $total = $row['total'];
+    }
+    $stmt->close();
+    
+    return $total;
+}
+
+// Función para construir árbol jerárquico
+function construirArbolEjecutivos($conn, $id_padre = null, $fecha_inicio, $fecha_fin) {
+    $arbol = array();
+    $query = "SELECT e.id_eje, e.nom_eje, e.id_padre 
+              FROM ejecutivo e 
+              WHERE e.eli_eje = 1 AND e.id_padre " . ($id_padre ? "= ?" : "IS NULL") . "
+              ORDER BY e.nom_eje";
+    
+    $stmt = $conn->prepare($query);
+    if ($id_padre) {
+        $stmt->bind_param("i", $id_padre);
+    }
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    while ($row = $result->fetch_assoc()) {
+        // Obtener conteos
+        $conteo_individual = 0;
+        $query_count_individual = "SELECT COUNT(*) as total FROM citas c WHERE c.id_eje = ?";
+        if ($fecha_inicio && $fecha_fin) {
+            $query_count_individual .= " AND c.fec_cit BETWEEN ? AND ?";
+        }
+        
+        $stmt_individual = $conn->prepare($query_count_individual);
+        if ($fecha_inicio && $fecha_fin) {
+            $stmt_individual->bind_param("iss", $row['id_eje'], $fecha_inicio, $fecha_fin);
+        } else {
+            $stmt_individual->bind_param("i", $row['id_eje']);
+        }
+        $stmt_individual->execute();
+        $result_individual = $stmt_individual->get_result();
+        if ($result_individual) {
+            $row_individual = $result_individual->fetch_assoc();
+            $conteo_individual = $row_individual['total'];
+        }
+        $stmt_individual->close();
+        
+        $conteo_acumulado = getConteoAcumulado($conn, $row['id_eje'], $fecha_inicio, $fecha_fin);
+        
+        // Obtener planteles del ejecutivo
+        $planteles_eje = array();
+        $query_pla = "SELECT id_pla FROM ejecutivo_plantel WHERE id_eje = ".$row['id_eje'];
+        $result_pla = $conn->query($query_pla);
+        while($row_pla = $result_pla->fetch_assoc()) {
+            $planteles_eje[] = $row_pla['id_pla'];
+        }
+        
+        // Obtener hijos recursivamente
+        $hijos = construirArbolEjecutivos($conn, $row['id_eje'], $fecha_inicio, $fecha_fin);
+        
+        $ejecutivo = array(
+            'id' => 'eje_'.$row['id_eje'],
+            'text' => $row['nom_eje'].
+                " <a href='citas.php?tipo=particular&id_eje=".$row['id_eje']."&fecha_inicio=$fecha_inicio&fecha_fin=$fecha_fin' class='badge badge-light'>".$conteo_individual."</a>".
+                " <a href='citas.php?tipo=recursivo&id_eje=".$row['id_eje']."&fecha_inicio=$fecha_inicio&fecha_fin=$fecha_fin' class='badge rounded-pill bg-purple text-white'>".$conteo_acumulado."</a>",
+            'original_id' => $row['id_eje'],
+            'icon' => 'fas fa-user',
+            'type' => 'eje',
+            'children' => $hijos,
+            'planteles' => $planteles_eje
+        );
+        
+        $arbol[] = $ejecutivo;
+    }
+    $stmt->close();
+    
+    return $arbol;
+}
 
 // Manejo de acciones
 if (isset($_GET['action'])) {
@@ -25,12 +209,12 @@ if (isset($_GET['action'])) {
     $fecha_fin = isset($_GET['fecha_fin']) && !empty($_GET['fecha_fin']) ? $_GET['fecha_fin'] : null;
     
     // Validar fechas
-    if ($fecha_inicio && !DateTime::createFromFormat('Y-m-d', $fecha_inicio)) {
+    if ($fecha_inicio && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $fecha_inicio)) {
         echo json_encode(array('error' => 'Formato de fecha inicio inválido'));
         exit;
     }
 
-    if ($fecha_fin && !DateTime::createFromFormat('Y-m-d', $fecha_fin)) {
+    if ($fecha_fin && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $fecha_fin)) {
         echo json_encode(array('error' => 'Formato de fecha fin inválido'));
         exit;
     }
@@ -47,96 +231,25 @@ if (isset($_GET['action'])) {
         $result = $conn->query($query);
         
         while($row = $result->fetch_assoc()) {
+            // Obtener conteo para el plantel
+            $conteo_plantel = getConteoPlantel($conn, $row['id_pla'], $fecha_inicio, $fecha_fin);
+            
             $planteles[$row['id_pla']] = array(
                 'id' => 'pla_'.$row['id_pla'],
-                'text' => $row['nom_pla'],
+                'text' => $row['nom_pla'] . 
+                    " <a href='citas.php?tipo=plantel&id_pla=".$row['id_pla']."&fecha_inicio=$fecha_inicio&fecha_fin=$fecha_fin' class='badge rounded-pill bg-purple text-white'>$conteo_plantel</a>",
                 'children' => array(),
                 'icon' => 'fas fa-building',
                 'type' => 'pla'
             );
         }
         
-        // Obtener todos los ejecutivos activos con sus planteles
-        $query = "SELECT e.id_eje, e.nom_eje, e.id_padre FROM ejecutivo e WHERE e.eli_eje = 1 ORDER BY e.nom_eje";
-        $result = $conn->query($query);
+        // Construir árbol de ejecutivos completo
+        $arbol_ejecutivos = construirArbolEjecutivos($conn, null, $fecha_inicio, $fecha_fin);
         
-        while($row = $result->fetch_assoc()) {
-            // Obtener planteles del ejecutivo
-            $planteles_eje = array();
-            $query_pla = "SELECT id_pla FROM ejecutivo_plantel WHERE id_eje = ".$row['id_eje'];
-            $result_pla = $conn->query($query_pla);
-            
-            while($row_pla = $result_pla->fetch_assoc()) {
-                $planteles_eje[] = $row_pla['id_pla'];
-            }
-            
-            // Obtener conteo de citas
-            $conteo_particular = 0;
-            $query_count = "SELECT COUNT(*) as total FROM citas c WHERE c.id_eje = ?";
-            if ($fecha_inicio && $fecha_fin) {
-                $query_count .= " AND c.fec_cit BETWEEN ? AND ?";
-            }
-
-            $stmt_count = $conn->prepare($query_count);
-            if ($fecha_inicio && $fecha_fin) {
-                $stmt_count->bind_param("iss", $row['id_eje'], $fecha_inicio, $fecha_fin);
-            } else {
-                $stmt_count->bind_param("i", $row['id_eje']);
-            }
-            $stmt_count->execute();
-            $result_count = $stmt_count->get_result();
-            if ($result_count) {
-                $row_count = $result_count->fetch_assoc();
-                $conteo_particular = $row_count['total'];
-                $stmt_count->close();
-            }
-            
-            // Obtener subordinados (hijos)
-            $subordinados = array();
-            $query_hijos = "SELECT id_eje, nom_eje FROM ejecutivo WHERE id_padre = ".$row['id_eje']." AND eli_eje = 1";
-            $result_hijos = $conn->query($query_hijos);
-            
-            while($row_hijo = $result_hijos->fetch_assoc()) {
-                // Obtener conteo de citas para cada hijo
-                $conteo_hijo = 0;
-                $query_count_hijo = "SELECT COUNT(*) as total FROM citas c WHERE c.id_eje = ?";
-                if ($fecha_inicio && $fecha_fin) {
-                    $query_count_hijo .= " AND c.fec_cit BETWEEN ? AND ?";
-                }
-
-                $stmt_count_hijo = $conn->prepare($query_count_hijo);
-                if ($fecha_inicio && $fecha_fin) {
-                    $stmt_count_hijo->bind_param("iss", $row_hijo['id_eje'], $fecha_inicio, $fecha_fin);
-                } else {
-                    $stmt_count_hijo->bind_param("i", $row_hijo['id_eje']);
-                }
-                $stmt_count_hijo->execute();
-                $result_count_hijo = $stmt_count_hijo->get_result();
-                if ($result_count_hijo) {
-                    $row_count_hijo = $result_count_hijo->fetch_assoc();
-                    $conteo_hijo = $row_count_hijo['total'];
-                    $stmt_count_hijo->close();
-                }
-                
-                $subordinados[] = array(
-                    'id' => 'eje_'.$row_hijo['id_eje'],
-                    'text' => $row_hijo['nom_eje']." <a href='citas.php?id_eje=".$row_hijo['id_eje']."&fecha_inicio=$fecha_inicio&fecha_fin=$fecha_fin' class='badge bg-white text-dark'>".$conteo_hijo."</a>",
-                    'icon' => 'fas fa-user',
-                    'type' => 'eje'
-                );
-            }
-            
-            $ejecutivo = array(
-                'id' => 'eje_'.$row['id_eje'],
-                'text' => $row['nom_eje']." <a href='citas.php?id_eje=".$row['id_eje']."&fecha_inicio=$fecha_inicio&fecha_fin=$fecha_fin' class='badge bg-white text-dark'>".$conteo_particular."</a>",
-                'original_id' => $row['id_eje'],
-                'icon' => 'fas fa-user',
-                'type' => 'eje',
-                'children' => $subordinados
-            );
-            
-            // Asignar ejecutivos a sus planteles
-            foreach ($planteles_eje as $plaId) {
+        // Asignar ejecutivos a sus planteles
+        foreach ($arbol_ejecutivos as $ejecutivo) {
+            foreach ($ejecutivo['planteles'] as $plaId) {
                 if (isset($planteles[$plaId])) {
                     $planteles[$plaId]['children'][] = $ejecutivo;
                 }
@@ -152,33 +265,13 @@ if (isset($_GET['action'])) {
         $planteles = array();
         while($row = $result->fetch_assoc()) {
             // Obtener conteo para cada plantel
-            $query_count = "SELECT COUNT(*) as total 
-                            FROM citas c 
-                            JOIN ejecutivo_plantel ep ON ep.id_eje = c.id_eje
-                            WHERE ep.id_pla = ?";
+            $conteo_plantel = getConteoPlantel($conn, $row['id_pla'], $fecha_inicio, $fecha_fin);
             
-            if ($fecha_inicio && $fecha_fin) {
-                $query_count .= " AND c.fec_cit BETWEEN ? AND ?";
-            }
-            
-            $stmt_count = $conn->prepare($query_count);
-            if ($fecha_inicio && $fecha_fin) {
-                $stmt_count->bind_param("iss", $row['id_pla'], $fecha_inicio, $fecha_fin);
-            } else {
-                $stmt_count->bind_param("i", $row['id_pla']);
-            }
-            $stmt_count->execute();
-            $result_count = $stmt_count->get_result();
-            
-            if ($result_count) {
-                $row_count = $result_count->fetch_assoc();
-                $planteles[] = array(
-                    'id_pla' => $row['id_pla'],
-                    'nom_pla' => $row['nom_pla'],
-                    'conteo' => $row_count['total']
-                );
-                $stmt_count->close();
-            }
+            $planteles[] = array(
+                'id_pla' => $row['id_pla'],
+                'nom_pla' => $row['nom_pla'],
+                'conteo' => $conteo_plantel
+            );
         }
         
         echo json_encode($planteles);
@@ -503,6 +596,50 @@ if (isset($_GET['action'])) {
             font-size: 12px;
             margin-left: 5px;
         }
+        
+        .jstree-anchor .badge {
+            margin-left: 5px;
+            font-size: 0.8em;
+        }
+        
+        .jstree-anchor a.badge {
+            text-decoration: none;
+        }
+        
+        .ejecutivo-link, .plantel-link {
+            color: inherit !important;
+            text-decoration: none !important;
+        }
+        
+        .ejecutivo-link:hover, .plantel-link:hover {
+            text-decoration: underline !important;
+        }
+        
+        .badge-light {
+            background-color: #f8f9fa;
+            color: #212529;
+            border: 1px solid #dee2e6;
+        }
+        
+        .jstree-anchor > i.jstree-themeicon {
+            margin-right: 5px;
+        }
+        
+        .jstree-clicked {
+            background-color: #f0f0f0 !important;
+        }
+        
+        .node-text {
+            cursor: pointer;
+        }
+        
+        .node-individual {
+            color: #333;
+        }
+        
+        .node-acumulado {
+            color: #6a0dad;
+        }
     </style>
 </head>
 <body>
@@ -714,6 +851,47 @@ if (isset($_GET['action'])) {
                 $('#selectedPlantel').html('<i class="fas fa-building me-1"></i> ' + selectedNode.text);
                 $('#id_padre').val(''); // Resetear padre cuando se selecciona plantel
             }
+        })
+        .on('ready.jstree', function() {
+            // Modificar el HTML de los nodos para separar el texto
+            $('#ejecutivosTree').find('.jstree-anchor').each(function() {
+                var $anchor = $(this);
+                var html = $anchor.html();
+                
+                // Extraer el texto del nodo (antes de los badges)
+                var textMatch = html.match(/^([^<]+)/);
+                if (textMatch) {
+                    var nodeText = textMatch[1].trim();
+                    var badges = html.replace(textMatch[0], '');
+                    
+                    $anchor.html(
+                        '<i class="jstree-themeicon" role="presentation"></i>' +
+                        '<a href="#" class="node-text">' + nodeText + '</a>' +
+                        badges
+                    );
+                }
+            });
+            
+            // Manejar clicks en el nombre del ejecutivo
+            $('#ejecutivosTree').on('click', '.node-text', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                var $anchor = $(this).closest('.jstree-anchor');
+                var node = $('#ejecutivosTree').jstree(true).get_node($anchor);
+                
+                if (node.type === 'eje') {
+                    $('#ejecutivosTree').jstree('select_node', node);
+                }
+                
+                return false;
+            });
+        });
+        
+        // Permitir clics en los badges
+        $('#ejecutivosTree').on('click', '.jstree-anchor a.badge', function(e) {
+            e.stopPropagation();
+            window.open($(this).attr('href'), '_self');
         });
         
         // Función para cargar detalles del ejecutivo
@@ -753,7 +931,7 @@ if (isset($_GET['action'])) {
                             '<div class="card-body text-center">' +
                             '<h5 class="card-title">' + plantel.nom_pla + '</h5>' +
                             '<div class="mt-3">' +
-                            '<a href="citas.php?id_pla=' + plantel.id_pla + '&fecha_inicio=' + fecha_inicio + '&fecha_fin=' + fecha_fin + '" class="badge rounded-pill bg-purple text-white p-2" style="font-size: 1.1em;">' +
+                            '<a href="citas.php?tipo=plantel&id_pla=' + plantel.id_pla + '&fecha_inicio=' + fecha_inicio + '&fecha_fin=' + fecha_fin + '" class="badge rounded-pill bg-purple text-white p-2" style="font-size: 1.1em;">' +
                             plantel.conteo +
                             '</a>' +
                             '</div>' +
